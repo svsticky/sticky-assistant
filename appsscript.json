@@ -28,11 +28,11 @@
   "addOns": {
     "common": {
       "name": "Sticky Assistant",
-      "logoUrl": "https://svsticky.nl/icons/icon-48x48.png",
+      "logoUrl": "https://public.svsticky.nl/logos/hoofd_outline_kleur.png",
       "useLocaleFromApp": true,
       "layoutProperties": {
-        "primaryColor": "#FA6B20",
-        "secondaryColor": "#FA6B20"
+        "primaryColor": "#B21B21",
+        "secondaryColor": "#B21B21"
       },
       "homepageTrigger": {
         "runFunction": "onDefaultHomepage"
