@@ -30,6 +30,7 @@ export interface ActionPointsScanResult {
   openMatches: ActionPointOccurrence[];
   completedMatches: ActionPointOccurrence[];
   foundPeople: Record<string, boolean>;
+  nextMeetingDate: string | null;
 }
 
 function buildAliasLookup(peopleConfig: Record<string, PeopleConfigEntry>) {
@@ -83,6 +84,22 @@ function resolveAssignees(
 function getOrderForPerson(personName: string, peopleConfig: Record<string, PeopleConfigEntry>) {
   const entry = peopleConfig[personName] || {};
   return typeof entry.order === 'number' ? entry.order : null;
+}
+
+export function parseMeetingDate(text: string): string | null {
+  if (!text) return null;
+
+  const isoMatch = text.match(/\b(\d{4})[-/](\d{2})[-/](\d{2})\b/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+
+  const dmyMatch = text.match(/\b(\d{2})[-/](\d{2})[-/](\d{4})\b/);
+  if (dmyMatch) {
+    return `${dmyMatch[3]}-${dmyMatch[2]}-${dmyMatch[1]}`;
+  }
+
+  return null;
 }
 
 /**
@@ -140,14 +157,19 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
   const peopleConfig = loadMergedPeopleConfig(config.peopleConfig);
   const aliasLookup = buildAliasLookup(peopleConfig);
 
-  // Expect standard YYYY-MM-DD date format standard: [2026-05-27]
-  const dateRegex = /\[(\d{4}-\d{2}-\d{2})\]/;
+  // Expect standard YYYY-MM-DD or DD-MM-YYYY date format standard: [2026-05-27] or [27-05-2026]
+  const dateRegex = /\[(\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})\]/;
 
   const openTasks: ActionPointTask[] = [];
   const completedTasks: ActionPointTask[] = [];
   const openMatches: ActionPointOccurrence[] = [];
   const completedMatches: ActionPointOccurrence[] = [];
   const foundPeople: Record<string, boolean> = {};
+
+  let meetingHeaderIndex: number | null = null;
+  let meetingHeaderNesting = -1;
+  let nextMeetingDate: string | null = null;
+  let meetingSearchDone = false;
 
   for (let i = 0; i < numChildren; i++) {
     const child = body.getChild(i);
@@ -158,6 +180,37 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
     }
 
     const text = (child as any).getText();
+    const trimmedText = text.trim();
+
+    if (trimmedText.length > 0) {
+      const isListItem = type === DocumentApp.ElementType.LIST_ITEM;
+      const currentNesting = isListItem ? (child as any).getNestingLevel() : -1;
+
+      // --- Dynamic Meeting Date Resolution (Single Pass) ---
+      if (!meetingSearchDone && !nextMeetingDate) {
+        if (meetingHeaderIndex === null) {
+          if (/^(?:Volgende\s+vergadering|Next\s+meetings?)\b/i.test(trimmedText)) {
+            meetingHeaderIndex = i;
+            meetingHeaderNesting = currentNesting;
+          }
+        } else {
+          if (isListItem && currentNesting > meetingHeaderNesting) {
+            const parsed = parseMeetingDate(trimmedText);
+            if (parsed) {
+              nextMeetingDate = parsed;
+              meetingSearchDone = true;
+            }
+          } else {
+            if (isListItem && currentNesting <= meetingHeaderNesting) {
+              meetingSearchDone = true;
+            } else if (!isListItem && meetingHeaderNesting >= 0) {
+              meetingSearchDone = true;
+            }
+          }
+        }
+      }
+    }
+
     const regex = /\bAP\s+([^:]+):\s+(.+)/gi;
     let match: RegExpExecArray | null;
 
@@ -171,12 +224,12 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
 
       let dateMatch = namePart.match(dateRegex);
       if (dateMatch) {
-        taskDate = dateMatch[1];
+        taskDate = parseMeetingDate(dateMatch[1]);
         namePart = namePart.replace(dateRegex, '').trim();
       } else {
         dateMatch = actionPart.match(dateRegex);
         if (dateMatch) {
-          taskDate = dateMatch[1];
+          taskDate = parseMeetingDate(dateMatch[1]);
           actionPart = actionPart.replace(dateRegex, '').trim();
         }
       }
@@ -232,5 +285,6 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
     openMatches,
     completedMatches,
     foundPeople,
+    nextMeetingDate,
   };
 }

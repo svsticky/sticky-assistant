@@ -8,7 +8,8 @@ vi.hoisted(() => {
   } as any;
 });
 
-import { applyDocumentActionsLogic } from './editing';
+import { applyDocumentActionsLogic, formatTodoistExportTask } from './editing';
+import { parseMeetingDate, scanActionPointsDocument } from './scanning';
 
 // Mock properties/settings
 const mockUserProperties: Record<string, string> = {};
@@ -69,6 +70,10 @@ class MockParagraph extends MockElement {
 
 class MockListItem extends MockElement {
   glyphType: any;
+  nestingLevel: number = 0;
+  getNestingLevel() {
+    return this.nestingLevel;
+  }
   setGlyphType(glyphType: any) {
     this.glyphType = glyphType;
     return this;
@@ -205,5 +210,158 @@ describe('applyDocumentActionsLogic', () => {
     expect(mockChildren[1].text).toBe('AP Ruben: Task 1 [2026-06-15]');
     expect(mockChildren[1].getType()).toBe('LIST_ITEM');
     expect((mockChildren[1] as MockListItem).glyphType).toBe('BULLET');
+  });
+});
+
+describe('formatTodoistExportTask', () => {
+  it('formats correctly with date, person (todoist_id), and section configured', () => {
+    const task = {
+      person: 'Ruben',
+      action: 'Write code',
+      date: '2026-07-01',
+      order: 1,
+    };
+    const peopleConfig = {
+      Ruben: {
+        todoist_id: 'RubenBroere',
+        todoist_section: 'Development',
+      },
+    };
+    const result = formatTodoistExportTask(task, peopleConfig);
+    expect(result).toBe('[AP] 2026-07-01 +RubenBroere /Development Write code');
+  });
+
+  it('defaults to today when date is null', () => {
+    const task = {
+      person: 'Bob',
+      action: 'Test application',
+      date: null,
+      order: 3,
+    };
+    const peopleConfig = {
+      Bob: {
+        todoist_id: 'BobTester',
+        todoist_section: 'QA',
+      },
+    };
+    const result = formatTodoistExportTask(task, peopleConfig);
+    const d = new Date();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const date = String(d.getDate()).padStart(2, '0');
+    const expectedToday = `${year}-${month}-${date}`;
+    expect(result).toBe(`[AP] ${expectedToday} +BobTester /QA Test application`);
+  });
+
+  it('falls back to task.person when not in configuration', () => {
+    const task = {
+      person: 'Charlie',
+      action: 'Deploy app',
+      date: '2026-07-03',
+      order: 4,
+    };
+    const peopleConfig = {};
+    const result = formatTodoistExportTask(task, peopleConfig);
+    expect(result).toBe('[AP] 2026-07-03 +Charlie Deploy app');
+  });
+
+  it('falls back to task.person when in configuration but without todoist_id', () => {
+    const task = {
+      person: 'Diana',
+      action: 'Write docs',
+      date: '2026-07-04',
+      order: 5,
+    };
+    const peopleConfig = {
+      Diana: {
+        // no todoist_id
+      },
+    };
+    const result = formatTodoistExportTask(task, peopleConfig);
+    expect(result).toBe('[AP] 2026-07-04 +Diana Write docs');
+  });
+
+  it('uses defaultDueDate when task date is null', () => {
+    const task = {
+      person: 'Alice',
+      action: 'Run task',
+      date: null,
+      order: 1,
+    };
+    const peopleConfig = {
+      Alice: {
+        todoist_id: 'AliceA',
+      },
+    };
+    const result = formatTodoistExportTask(task, peopleConfig, '2026-07-15');
+    expect(result).toBe('[AP] 2026-07-15 +AliceA Run task');
+  });
+});
+
+describe('parseMeetingDate', () => {
+  it('parses YYYY-MM-DD format', () => {
+    expect(parseMeetingDate('Volgende meeting is 2026-07-15.')).toBe('2026-07-15');
+  });
+
+  it('parses YYYY/MM/DD format', () => {
+    expect(parseMeetingDate('Volgende meeting is 2026/07/15.')).toBe('2026-07-15');
+  });
+
+  it('parses DD-MM-YYYY format', () => {
+    expect(parseMeetingDate('Volgende meeting is 15-07-2026.')).toBe('2026-07-15');
+  });
+
+  it('parses DD/MM/YYYY format', () => {
+    expect(parseMeetingDate('Volgende meeting is 15/07/2026.')).toBe('2026-07-15');
+  });
+
+  it('returns null on invalid formats', () => {
+    expect(parseMeetingDate('No meeting date specified')).toBeNull();
+    expect(parseMeetingDate('dinsdag 7 juli 2026')).toBeNull();
+  });
+});
+
+describe('scanActionPointsDocument next meeting date', () => {
+  beforeEach(() => {
+    mockChildren = [];
+  });
+
+  it('finds nested meeting date under Volgende vergadering list item', () => {
+    const heading = new MockListItem('LIST_ITEM', 'Volgende vergadering');
+    heading.nestingLevel = 0;
+    const dateItem = new MockListItem('LIST_ITEM', 'Volgende vergadering op 07-07-2026');
+    dateItem.nestingLevel = 1;
+
+    mockChildren.push(heading, dateItem);
+
+    const result = scanActionPointsDocument();
+    expect(result?.nextMeetingDate).toBe('2026-07-07');
+  });
+
+  it('finds nested meeting date under Next meeting paragraph', () => {
+    const heading = new MockParagraph('PARAGRAPH', 'Next meeting:');
+    const dateItem = new MockListItem('LIST_ITEM', '15-09-2026 - online');
+    dateItem.nestingLevel = 0;
+
+    mockChildren.push(heading, dateItem);
+
+    const result = scanActionPointsDocument();
+    expect(result?.nextMeetingDate).toBe('2026-09-15');
+  });
+
+  it('stops search if sibling or parent element is encountered', () => {
+    const heading = new MockListItem('LIST_ITEM', 'Volgende vergadering');
+    heading.nestingLevel = 1;
+    
+    const anotherHeading = new MockListItem('LIST_ITEM', 'Other topic');
+    anotherHeading.nestingLevel = 1;
+
+    const dateItem = new MockListItem('LIST_ITEM', '07-07-2026');
+    dateItem.nestingLevel = 2; // indented under "Other topic"
+
+    mockChildren.push(heading, anotherHeading, dateItem);
+
+    const result = scanActionPointsDocument();
+    expect(result?.nextMeetingDate).toBeNull();
   });
 });

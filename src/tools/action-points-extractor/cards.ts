@@ -5,6 +5,7 @@ import {
   applyDocumentActionsLogic,
   sendToTodoistLogic,
   populatePeopleConfigLogic,
+  formatTodoistExportTask,
 } from './editing';
 import { buildToolCard, buildToolFooter } from '../../core/cardTemplate';
 import { COLORS, ICON_URLS } from '../../core/branding';
@@ -85,6 +86,36 @@ export function buildActionPointsScanResultsCard(
     });
   }
   builder.addSection(openSection);
+
+  // --- TODOIST PASTE EXPORT ---
+  if (scanResult.openTasks.length > 0) {
+    const todoistExportSection = CardService.newCardSection()
+      .setHeader('Todoist Paste Export')
+      .setCollapsible(true);
+
+    const config = actionPointsSettingsManager.load();
+    const peopleConfig = config.peopleConfig || {};
+
+    const sortedTasks = [...scanResult.openTasks].sort((x, y) => {
+      const xOrder = x.order !== null && x.order !== undefined ? x.order : Number.MAX_SAFE_INTEGER;
+      const yOrder = y.order !== null && y.order !== undefined ? y.order : Number.MAX_SAFE_INTEGER;
+      if (xOrder !== yOrder) return xOrder - yOrder;
+      return x.person.localeCompare(y.person);
+    });
+
+    const exportText = sortedTasks
+      .map((task) => formatTodoistExportTask(task, peopleConfig, scanResult.nextMeetingDate))
+      .join('\n');
+
+    todoistExportSection.addWidget(
+      CardService.newTextInput()
+        .setFieldName('todoistExportText')
+        .setTitle('Copy-paste tasks to Todoist')
+        .setMultiline(true)
+        .setValue(exportText)
+    );
+    builder.addSection(todoistExportSection);
+  }
 
   // --- COMPLETED ACTION POINTS ---
   const completedSection = CardService.newCardSection()

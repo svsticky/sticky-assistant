@@ -1,6 +1,7 @@
 export interface PeopleConfigEntry {
   aliases?: string[];
   todoist_id?: string;
+  todoist_section?: string;
   order?: number;
 }
 
@@ -70,6 +71,10 @@ export function validatePeopleConfig(config: any): { ok: boolean; message?: stri
 
     if (entry.todoist_id !== undefined && typeof entry.todoist_id !== 'string') {
       return { ok: false, message: `todoist_id for "${personName}" must be a string.` };
+    }
+
+    if (entry.todoist_section !== undefined && typeof entry.todoist_section !== 'string') {
+      return { ok: false, message: `todoist_section for "${personName}" must be a string.` };
     }
 
     if (entry.order !== undefined && typeof entry.order !== 'number') {

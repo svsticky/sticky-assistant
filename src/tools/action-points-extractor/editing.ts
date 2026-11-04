@@ -1,4 +1,6 @@
 import { actionPointsSettingsManager } from './settings';
+import { PeopleConfigEntry } from './config';
+import { ActionPointTask } from './scanning';
 
 export interface ActionPointsOperationResult {
   ok: boolean;
@@ -10,6 +12,46 @@ export interface ActionPointsOperationResult {
 function formatActionPoint(nameText: string, actionText: string, dateText: string | null) {
   const dateSuffix = dateText ? ` [${dateText}]` : '';
   return `AP ${nameText}: ${actionText}${dateSuffix}`;
+}
+
+function getTodayDateString(): string {
+  if (typeof Utilities !== 'undefined' && typeof Session !== 'undefined') {
+    try {
+      return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    } catch {
+      // fallback
+    }
+  }
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const date = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${date}`;
+}
+
+export function formatTodoistExportTask(
+  task: ActionPointTask,
+  peopleConfig: Record<string, PeopleConfigEntry>,
+  defaultDueDate?: string | null
+): string {
+  const parts: string[] = ['[AP]'];
+
+  const date = task.date || defaultDueDate || getTodayDateString();
+  parts.push(date);
+
+  const entry = peopleConfig[task.person];
+  const todoistId = entry?.todoist_id || task.person;
+  if (todoistId) {
+    parts.push(`+${todoistId}`);
+  }
+
+  if (entry?.todoist_section) {
+    parts.push(`/${entry.todoist_section}`);
+  }
+
+  parts.push(task.action);
+
+  return parts.join(' ');
 }
 
 export function sendToTodoistLogic(e: any) {
