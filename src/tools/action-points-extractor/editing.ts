@@ -145,7 +145,7 @@ export function applyDocumentActionsLogic(e: any) {
       return x.person.localeCompare(y.person);
     });
 
-    body.insertParagraph(0, 'Action points').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    body.insertParagraph(0, 'Action points').setHeading(DocumentApp.ParagraphHeading.HEADING1);
     let lastPerson: string | null = null;
     for (let i = expanded.length - 1; i >= 0; i--) {
       const item = expanded[i];
