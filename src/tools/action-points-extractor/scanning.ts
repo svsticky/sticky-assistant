@@ -86,6 +86,24 @@ function getOrderForPerson(personName: string, peopleConfig: Record<string, Peop
   return typeof entry.order === 'number' ? entry.order : null;
 }
 
+/**
+ * Shared comparator for ordering action points consistently.
+ * Sorts by ascending order property (with unconfigured tasks at the end),
+ * tiebreaking alphabetically by person name.
+ */
+export function compareActionPoints(
+  a: { order?: number | null; person: string },
+  b: { order?: number | null; person: string }
+): number {
+  const aOrder = a.order !== null && a.order !== undefined ? a.order : Number.MAX_SAFE_INTEGER;
+  const bOrder = b.order !== null && b.order !== undefined ? b.order : Number.MAX_SAFE_INTEGER;
+  if (aOrder !== bOrder) return aOrder - bOrder;
+  return a.person.localeCompare(b.person);
+}
+
+export const MEETING_HEADER_REGEX =
+  /^\s*(?:(?:\d+|[a-zA-Z])[.)]\s*|[•\-*]\s*|#{1,6}\s*)*(?:Volgende\s+(?:vergadering|meeting|bijeenkomst)|Next\s+meetings?)\b/i;
+
 export function parseMeetingDate(text: string): string | null {
   if (!text) return null;
 
@@ -146,16 +164,28 @@ function loadMergedPeopleConfig(
 }
 
 export function scanActionPointsDocument(): ActionPointsScanResult | null {
+  const startTime = Date.now();
   const doc = DocumentApp.getActiveDocument();
-  if (!doc) return null;
+  if (!doc) {
+    console.warn('[scanActionPointsDocument] No active document found.');
+    return null;
+  }
 
+  const docId = typeof doc.getId === 'function' ? doc.getId() : 'unknown';
+  const docName = typeof doc.getName === 'function' ? doc.getName() : 'unknown';
   const body = doc.getBody();
   const numChildren = body.getNumChildren();
+  console.log(
+    `[scanActionPointsDocument] Scanning document "${docName}" (ID: ${docId}, ${numChildren} top-level elements)...`
+  );
   const config = actionPointsSettingsManager.load();
 
   // Load and merge/override configurations
   const peopleConfig = loadMergedPeopleConfig(config.peopleConfig);
   const aliasLookup = buildAliasLookup(peopleConfig);
+  console.log(
+    `[scanActionPointsDocument] Loaded people config with ${Object.keys(peopleConfig).length} person entries.`
+  );
 
   // Expect standard YYYY-MM-DD or DD-MM-YYYY date format standard: [2026-05-27] or [27-05-2026]
   const dateRegex = /\[(\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})\]/;
@@ -186,29 +216,58 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
       const isListItem = type === DocumentApp.ElementType.LIST_ITEM;
       const currentNesting = isListItem ? (child as any).getNestingLevel() : -1;
 
-      // --- Dynamic Meeting Date Resolution (Single Pass) ---
+      // --- Dynamic Meeting Date Resolution ---
       if (!meetingSearchDone && !nextMeetingDate) {
-        if (meetingHeaderIndex === null) {
-          if (/^(?:Volgende\s+vergadering|Next\s+meetings?)\b/i.test(trimmedText)) {
-            meetingHeaderIndex = i;
-            meetingHeaderNesting = currentNesting;
-          }
-        } else {
-          if (isListItem && currentNesting > meetingHeaderNesting) {
-            const parsed = parseMeetingDate(trimmedText);
-            if (parsed) {
-              nextMeetingDate = parsed;
-              meetingSearchDone = true;
-            }
+        if (meetingHeaderIndex !== null) {
+          // Check if this child under the meeting header candidate contains a valid date
+          const parsed = parseMeetingDate(trimmedText);
+          if (parsed) {
+            nextMeetingDate = parsed;
+            meetingSearchDone = true;
+            console.log(
+              `[scanActionPointsDocument] Extracted next meeting date "${nextMeetingDate}" from child index ${i}: "${trimmedText}".`
+            );
           } else {
-            if (isListItem && currentNesting <= meetingHeaderNesting) {
-              meetingSearchDone = true;
-            } else if (!isListItem && meetingHeaderNesting >= 0) {
-              meetingSearchDone = true;
+            // Check if this candidate section has ended without finding a date
+            const isNextNumberedSection = /^\s*(?:\d+[.)]|#{1,6})\s*[A-Za-z]/i.test(trimmedText);
+            const isHigherOrEqualListLevel =
+              meetingHeaderNesting >= 0 && isListItem && currentNesting <= meetingHeaderNesting;
+            const exceededFirstChildren = i - meetingHeaderIndex >= 2;
+
+            if (isNextNumberedSection || isHigherOrEqualListLevel || exceededFirstChildren) {
+              console.log(
+                `[scanActionPointsDocument] Candidate at child index ${meetingHeaderIndex} did not contain a valid meeting date (ended at child index ${i}: "${trimmedText}"). Continuing search for next meeting section...`
+              );
+              // Reset candidate header so we continue scanning the rest of the document
+              meetingHeaderIndex = null;
+              meetingHeaderNesting = -1;
             }
           }
         }
+
+        // Check if current child is a new candidate header
+        if (meetingHeaderIndex === null && MEETING_HEADER_REGEX.test(trimmedText)) {
+          meetingHeaderIndex = i;
+          meetingHeaderNesting = currentNesting;
+          console.log(
+            `[scanActionPointsDocument] Meeting section candidate found at child index ${i}: "${trimmedText}"`
+          );
+
+          // Check if meeting date is on the same line as the header
+          const sameLineDate = parseMeetingDate(trimmedText);
+          if (sameLineDate) {
+            nextMeetingDate = sameLineDate;
+            meetingSearchDone = true;
+            console.log(
+              `[scanActionPointsDocument] Extracted next meeting date "${nextMeetingDate}" from header line at child index ${i}.`
+            );
+          }
+        }
       }
+    }
+
+    if (!/\bAP\s+/i.test(text)) {
+      continue;
     }
 
     const regex = /\bAP\s+([^:]+):\s+(.+)/gi;
@@ -239,6 +298,9 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
       }
 
       const assignees = resolveAssignees(namePart, peopleConfig, aliasLookup);
+      console.log(
+        `[scanActionPointsDocument] Child ${i}: Matched AP [${assignees.join(', ')}] "${actionPart}" (due: ${taskDate || 'none'}, status: ${isBold ? 'OPEN' : 'COMPLETED'})`
+      );
 
       const matchObj: ActionPointOccurrence = {
         originalName: namePart,
@@ -256,6 +318,17 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
 
       assignees.forEach((assignee) => {
         foundPeople[assignee] = true;
+        const isConfigured = Boolean(peopleConfig[assignee] || aliasLookup[assignee.toLowerCase()]);
+        if (
+          !isConfigured &&
+          assignee.toLowerCase() !== 'everyone' &&
+          assignee.toLowerCase() !== 'iedereen'
+        ) {
+          console.log(
+            `[scanActionPointsDocument] Notice: Assignee "${assignee}" is not configured in settings.`
+          );
+        }
+
         const task: ActionPointTask = {
           person: assignee,
           action: actionPart,
@@ -278,6 +351,11 @@ export function scanActionPointsDocument(): ActionPointsScanResult | null {
       }
     }
   }
+
+  const durationMs = Date.now() - startTime;
+  console.log(
+    `[scanActionPointsDocument] Scan completed in ${durationMs}ms. Found: ${openTasks.length} open tasks (${openMatches.length} occurrences), ${completedTasks.length} completed tasks (${completedMatches.length} occurrences), ${Object.keys(foundPeople).length} detected people: [${Object.keys(foundPeople).join(', ')}], nextMeetingDate: ${nextMeetingDate || 'none'}`
+  );
 
   return {
     openTasks,

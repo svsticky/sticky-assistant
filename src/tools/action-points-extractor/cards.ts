@@ -1,11 +1,12 @@
 import { getActiveParentFolder } from '../../core/settingsStore';
-import { ActionPointsScanResult, scanActionPointsDocument } from './scanning';
+import { ActionPointsScanResult, compareActionPoints, scanActionPointsDocument } from './scanning';
 import { actionPointsSettingsManager, ACTION_POINTS_SETTINGS } from './settings';
 import {
   applyDocumentActionsLogic,
   sendToTodoistLogic,
   populatePeopleConfigLogic,
   formatTodoistExportTask,
+  getNewDetectedPeople,
 } from './editing';
 import { buildToolCard, buildToolFooter } from '../../core/cardTemplate';
 import { COLORS, ICON_URLS } from '../../core/branding';
@@ -22,15 +23,18 @@ function createActionPointsBuilder() {
 }
 
 export function createActionPointsHomepage(): GoogleAppsScript.Card_Service.Card {
+  console.log('[createActionPointsHomepage] Rendering Action Points home card.');
   const builder = createActionPointsBuilder();
   const section = CardService.newCardSection();
 
   const scanAction = CardService.newAction().setFunctionName('scanDocument');
   section.addWidget(
-    CardService.newTextButton()
-      .setText('Scan Document')
-      .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-      .setOnClickAction(scanAction)
+    CardService.newButtonSet().addButton(
+      CardService.newTextButton()
+        .setText('Scan Document')
+        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        .setOnClickAction(scanAction)
+    )
   );
 
   builder.addSection(section);
@@ -41,6 +45,9 @@ export function createActionPointsHomepage(): GoogleAppsScript.Card_Service.Card
 export function buildActionPointsScanResultsCard(
   scanResult: ActionPointsScanResult
 ): GoogleAppsScript.Card_Service.Card {
+  console.log(
+    `[buildActionPointsScanResultsCard] Building results card: ${scanResult.openTasks.length} open tasks (${scanResult.openMatches.length} matches), ${scanResult.completedTasks.length} completed tasks (${scanResult.completedMatches.length} matches).`
+  );
   const builder = createActionPointsBuilder();
   builder.setHeader(CardService.newCardHeader().setTitle('Scan Results'));
 
@@ -57,6 +64,133 @@ export function buildActionPointsScanResultsCard(
   );
   builder.addSection(summarySection);
 
+  // --- ACTIONS SECTION ---
+  // Positioned immediately after summary so action buttons are always accessible and
+  // never truncated by Google Workspace's 100-widget limit.
+  const actionSection = CardService.newCardSection().setHeader('Actions');
+  const config = actionPointsSettingsManager.load();
+  console.log(
+    `[buildActionPointsScanResultsCard] Building Actions section: enableTodoist=${config.enableTodoist}, openMatches=${scanResult.openMatches.length}, completedMatches=${scanResult.completedMatches.length}`
+  );
+
+  if (config.enableTodoist && scanResult.openTasks.length > 0) {
+    console.log(
+      '[buildActionPointsScanResultsCard] Adding Todoist Sync button to Actions section.'
+    );
+    actionSection.addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText('Sync Open Tasks to Todoist')
+          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+          .setOnClickAction(
+            CardService.newAction()
+              .setFunctionName('sendToTodoist')
+              .setParameters({ nextMeetingDate: scanResult.nextMeetingDate || '' })
+          )
+      )
+    );
+  } else if (config.enableTodoist) {
+    actionSection.addWidget(
+      CardService.newDecoratedText()
+        .setStartIcon(CardService.newIconImage().setIcon(CardService.Icon.STAR))
+        .setText(`<font color="${COLORS.MUTED}"><i>No open action points to sync.</i></font>`)
+    );
+  }
+
+  if (scanResult.openMatches.length > 0 || scanResult.completedMatches.length > 0) {
+    console.log(
+      `[buildActionPointsScanResultsCard] Adding Apply Changes widgets (openMatches=${scanResult.openMatches.length}, completedMatches=${scanResult.completedMatches.length}).`
+    );
+    actionSection.addWidget(
+      CardService.newSelectionInput()
+        .setType(CardService.SelectionInputType.CHECK_BOX)
+        .setFieldName('addToTopAction')
+        .addItem('Insert summary list at top', 'addToTop', false)
+    );
+    actionSection.addWidget(
+      CardService.newSelectionInput()
+        .setType(CardService.SelectionInputType.CHECK_BOX)
+        .setFieldName('replaceInPlaceAction')
+        .addItem('Format completed in-place', 'replaceInPlace', false)
+    );
+
+    actionSection.addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText('Apply Changes')
+          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+          .setOnClickAction(CardService.newAction().setFunctionName('applyDocumentActions'))
+      )
+    );
+  } else {
+    console.log(
+      '[buildActionPointsScanResultsCard] No open or completed matches; skipping Apply Changes widgets.'
+    );
+  }
+
+  const newPeopleList = getNewDetectedPeople(scanResult.foundPeople, config.peopleConfig || {});
+  if (newPeopleList.length > 0) {
+    console.log(
+      `[buildActionPointsScanResultsCard] Adding Add Detected People button for ${newPeopleList.length} new people: ${newPeopleList.join(', ')}`
+    );
+    actionSection.addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText(`Add Detected People (${newPeopleList.length}) to Settings`)
+          .setOnClickAction(
+            CardService.newAction()
+              .setFunctionName('buildAddPeopleLayerCard')
+              .setParameters({ peopleJson: JSON.stringify(newPeopleList) })
+          )
+      )
+    );
+  }
+
+  // Back button returning to Action Points Homepage using generic openTool action
+  const backAction = CardService.newAction()
+    .setFunctionName('openTool')
+    .setParameters({ toolId: 'actionPointsExtractor' });
+
+  actionSection.addWidget(
+    CardService.newButtonSet().addButton(
+      CardService.newTextButton().setText('Back').setOnClickAction(backAction)
+    )
+  );
+
+  builder.addSection(actionSection);
+
+  // --- TODOIST PASTE EXPORT ---
+  if (scanResult.openTasks.length > 0) {
+    const todoistExportSection = CardService.newCardSection()
+      .setHeader('Todoist Paste Export')
+      .setCollapsible(true);
+
+    const peopleConfig = config.peopleConfig || {};
+
+    const sortedTasks = [...scanResult.openTasks].sort(compareActionPoints);
+
+    const lines: string[] = [];
+    let lastPerson: string | null = null;
+    sortedTasks.forEach((task) => {
+      if (lastPerson !== null && task.person !== lastPerson) {
+        lines.push(''); // Blank line between different people
+      }
+      lines.push(formatTodoistExportTask(task, peopleConfig, scanResult.nextMeetingDate));
+      lastPerson = task.person;
+    });
+
+    const exportText = lines.join('\n');
+
+    todoistExportSection.addWidget(
+      CardService.newTextInput()
+        .setFieldName('todoistExportText')
+        .setTitle('Copy-paste tasks to Todoist')
+        .setMultiline(true)
+        .setValue(exportText)
+    );
+    builder.addSection(todoistExportSection);
+  }
+
   // --- OPEN ACTION POINTS ---
   const openSection = CardService.newCardSection()
     .setHeader('Open Action Points')
@@ -70,52 +204,43 @@ export function buildActionPointsScanResultsCard(
         .setText(`<font color="${COLORS.MUTED}"><i>No open action points found.</i></font>`)
     );
   } else {
-    scanResult.openTasks.forEach((task) => {
+    // Cap displayed task widgets to prevent exceeding Google Workspace's 100-widget limit
+    const MAX_DISPLAYED_OPEN_TASKS = 25;
+    const tasksToDisplay = scanResult.openTasks.slice(0, MAX_DISPLAYED_OPEN_TASKS);
+
+    tasksToDisplay.forEach((task) => {
       const showAction = CardService.newAction()
         .setFunctionName('jumpToTask')
         .setParameters({ childIndex: String(task.childIndex ?? 0) });
+
+      const dueLabel = task.date
+        ? `Due: ${task.date}`
+        : scanResult.nextMeetingDate
+          ? `Due: ${scanResult.nextMeetingDate} (Next meeting)`
+          : 'No due date';
 
       openSection.addWidget(
         CardService.newDecoratedText()
           .setStartIcon(CardService.newIconImage().setIcon(CardService.Icon.CLOCK))
           .setText(`<b>${task.person}</b>: ${task.action}`)
-          .setBottomLabel(task.date ? `Due: ${task.date}` : 'No due date')
+          .setBottomLabel(dueLabel)
           .setWrapText(true)
           .setButton(CardService.newTextButton().setText('Show').setOnClickAction(showAction))
       );
     });
+
+    if (scanResult.openTasks.length > MAX_DISPLAYED_OPEN_TASKS) {
+      openSection.addWidget(
+        CardService.newDecoratedText()
+          .setStartIcon(CardService.newIconImage().setIcon(CardService.Icon.DESCRIPTION))
+          .setText(
+            `<font color="${COLORS.MUTED}"><i>Showing first ${MAX_DISPLAYED_OPEN_TASKS} of ${scanResult.openTasks.length} open tasks. All tasks are included in summary insertion and Todoist export.</i></font>`
+          )
+          .setWrapText(true)
+      );
+    }
   }
   builder.addSection(openSection);
-
-  // --- TODOIST PASTE EXPORT ---
-  if (scanResult.openTasks.length > 0) {
-    const todoistExportSection = CardService.newCardSection()
-      .setHeader('Todoist Paste Export')
-      .setCollapsible(true);
-
-    const config = actionPointsSettingsManager.load();
-    const peopleConfig = config.peopleConfig || {};
-
-    const sortedTasks = [...scanResult.openTasks].sort((x, y) => {
-      const xOrder = x.order !== null && x.order !== undefined ? x.order : Number.MAX_SAFE_INTEGER;
-      const yOrder = y.order !== null && y.order !== undefined ? y.order : Number.MAX_SAFE_INTEGER;
-      if (xOrder !== yOrder) return xOrder - yOrder;
-      return x.person.localeCompare(y.person);
-    });
-
-    const exportText = sortedTasks
-      .map((task) => formatTodoistExportTask(task, peopleConfig, scanResult.nextMeetingDate))
-      .join('\n');
-
-    todoistExportSection.addWidget(
-      CardService.newTextInput()
-        .setFieldName('todoistExportText')
-        .setTitle('Copy-paste tasks to Todoist')
-        .setMultiline(true)
-        .setValue(exportText)
-    );
-    builder.addSection(todoistExportSection);
-  }
 
   // --- COMPLETED ACTION POINTS ---
   const completedSection = CardService.newCardSection()
@@ -130,7 +255,11 @@ export function buildActionPointsScanResultsCard(
         .setText(`<font color="${COLORS.MUTED}"><i>No completed action points found.</i></font>`)
     );
   } else {
-    scanResult.completedTasks.forEach((task) => {
+    // Cap displayed completed task widgets to prevent exceeding Google Workspace's 100-widget limit
+    const MAX_DISPLAYED_COMPLETED_TASKS = 15;
+    const completedToDisplay = scanResult.completedTasks.slice(0, MAX_DISPLAYED_COMPLETED_TASKS);
+
+    completedToDisplay.forEach((task) => {
       const showAction = CardService.newAction()
         .setFunctionName('jumpToTask')
         .setParameters({ childIndex: String(task.childIndex ?? 0) });
@@ -148,86 +277,21 @@ export function buildActionPointsScanResultsCard(
           .setButton(CardService.newTextButton().setText('Show').setOnClickAction(showAction))
       );
     });
+
+    if (scanResult.completedTasks.length > MAX_DISPLAYED_COMPLETED_TASKS) {
+      completedSection.addWidget(
+        CardService.newDecoratedText()
+          .setStartIcon(CardService.newIconImage().setIcon(CardService.Icon.DESCRIPTION))
+          .setText(
+            `<font color="${COLORS.MUTED}"><i>Showing first ${MAX_DISPLAYED_COMPLETED_TASKS} of ${scanResult.completedTasks.length} completed tasks.</i></font>`
+          )
+          .setWrapText(true)
+      );
+    }
   }
   builder.addSection(completedSection);
 
-  // --- ACTIONS SECTION ---
-  const actionSection = CardService.newCardSection().setHeader('Actions');
-  const config = actionPointsSettingsManager.load();
-
-  if (config.enableTodoist && scanResult.openTasks.length > 0) {
-    actionSection.addWidget(
-      CardService.newTextButton()
-        .setText('Sync Open Tasks to Todoist')
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName('sendToTodoist')
-            .setParameters({ tasksJson: JSON.stringify(scanResult.openTasks) })
-        )
-    );
-  } else if (config.enableTodoist) {
-    actionSection.addWidget(
-      CardService.newDecoratedText()
-        .setStartIcon(CardService.newIconImage().setIcon(CardService.Icon.STAR))
-        .setText(`<font color="${COLORS.MUTED}"><i>No open action points to sync.</i></font>`)
-    );
-  }
-
-  if (scanResult.openMatches.length > 0 || scanResult.completedMatches.length > 0) {
-    actionSection.addWidget(
-      CardService.newSelectionInput()
-        .setType(CardService.SelectionInputType.CHECK_BOX)
-        .setFieldName('addToTopAction')
-        .addItem('Insert summary list at top', 'addToTop', false)
-    );
-    actionSection.addWidget(
-      CardService.newSelectionInput()
-        .setType(CardService.SelectionInputType.CHECK_BOX)
-        .setFieldName('replaceInPlaceAction')
-        .addItem('Format completed in-place', 'replaceInPlace', false)
-    );
-
-    actionSection.addWidget(
-      CardService.newTextButton()
-        .setText('Apply Changes')
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName('applyDocumentActions')
-            .setParameters({
-              matchesJson: JSON.stringify({
-                openMatches: scanResult.openMatches,
-                completedMatches: scanResult.completedMatches,
-              }),
-            })
-        )
-    );
-  }
-
-  const foundPeopleList = Object.keys(scanResult.foundPeople).filter(
-    (name) => name.toLowerCase() !== 'everyone'
-  );
-  if (foundPeopleList.length > 0) {
-    actionSection.addWidget(
-      CardService.newTextButton()
-        .setText('Add Detected People to Settings')
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName('buildAddPeopleLayerCard')
-            .setParameters({ peopleJson: JSON.stringify(foundPeopleList) })
-        )
-    );
-  }
-
-  // Back button returning to Action Points Homepage using generic openTool action
-  const backAction = CardService.newAction()
-    .setFunctionName('openTool')
-    .setParameters({ toolId: 'actionPointsExtractor' });
-
-  actionSection.addWidget(CardService.newTextButton().setText('Back').setOnClickAction(backAction));
-
-  builder.addSection(actionSection);
+  console.log('[buildActionPointsScanResultsCard] Finished building scan results card.');
   return builder.build();
 }
 
@@ -238,6 +302,7 @@ export function buildActionPointsScanResultsCard(
 export function buildAddPeopleLayerCard(e: {
   parameters?: Record<string, string>;
 }): GoogleAppsScript.Card_Service.Card {
+  console.log('[buildAddPeopleLayerCard] Rendering Add People card.');
   const params = e.parameters || {};
   const peopleJson = params.peopleJson || '[]';
 
@@ -250,13 +315,23 @@ export function buildAddPeopleLayerCard(e: {
 
   const parentFolder = getActiveParentFolder(e);
 
+  let peopleNamesDisplay = '';
+  try {
+    const parsed = JSON.parse(peopleJson);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      peopleNamesDisplay = `New assignees: ${parsed.join(', ')}.\n`;
+    }
+  } catch {
+    // fallback
+  }
+
   const section = CardService.newCardSection().setHeader('Add Options');
   section.addWidget(
     CardService.newDecoratedText()
       .setStartIcon(CardService.newIconImage().setIconUrl(ICON_URLS.info))
       .setText('<b>Add Detected People</b>')
       .setBottomLabel(
-        'Add the newly detected assignees to either your Workspace folder config or Global account settings.'
+        `${peopleNamesDisplay}Add the newly detected assignees to either your Workspace folder config or Global account settings.`
       )
       .setWrapText(true)
   );
@@ -268,10 +343,12 @@ export function buildAddPeopleLayerCard(e: {
       .setParameters({ peopleJson, targetLayer: 'workspace' });
 
     section.addWidget(
-      CardService.newTextButton()
-        .setText('Add to Workspace (This Folder)')
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(addWorkspaceAction)
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText('Add to Workspace (This Folder)')
+          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+          .setOnClickAction(addWorkspaceAction)
+      )
     );
   }
 
@@ -281,7 +358,11 @@ export function buildAddPeopleLayerCard(e: {
     .setParameters({ peopleJson, targetLayer: 'global' });
 
   section.addWidget(
-    CardService.newTextButton().setText('Add to Global (Account)').setOnClickAction(addGlobalAction)
+    CardService.newButtonSet().addButton(
+      CardService.newTextButton()
+        .setText('Add to Global (Account)')
+        .setOnClickAction(addGlobalAction)
+    )
   );
 
   // Back action returning to home
@@ -289,7 +370,11 @@ export function buildAddPeopleLayerCard(e: {
     .setFunctionName('openTool')
     .setParameters({ toolId: 'actionPointsExtractor' });
 
-  section.addWidget(CardService.newTextButton().setText('Cancel').setOnClickAction(backAction));
+  section.addWidget(
+    CardService.newButtonSet().addButton(
+      CardService.newTextButton().setText('Cancel').setOnClickAction(backAction)
+    )
+  );
 
   builder.addSection(section);
   return builder.build();
@@ -301,6 +386,7 @@ export function buildAddPeopleLayerCard(e: {
 export function jumpToTask(e: { parameters?: Record<string, string> }) {
   const params = e.parameters || {};
   const childIndex = Number(params.childIndex || 0);
+  console.log(`[jumpToTask] Jump requested to paragraph at body child index ${childIndex}...`);
 
   try {
     const doc = DocumentApp.getActiveDocument();
@@ -313,10 +399,12 @@ export function jumpToTask(e: { parameters?: Record<string, string> }) {
     rangeBuilder.addElement(child);
     doc.setSelection(rangeBuilder.build());
 
+    console.log(`[jumpToTask] Selected child index ${childIndex} successfully.`);
     return CardService.newActionResponseBuilder()
       .setNotification(CardService.newNotification().setText('Task selected & scrolled into view'))
       .build();
   } catch (err) {
+    console.error(`[jumpToTask] Error locating element: `, err);
     return CardService.newActionResponseBuilder()
       .setNotification(
         CardService.newNotification().setText('Could not locate element: ' + String(err))
@@ -326,8 +414,10 @@ export function jumpToTask(e: { parameters?: Record<string, string> }) {
 }
 
 export function scanDocument() {
+  console.log('[scanDocument] scanDocument action invoked.');
   const scanResult = scanActionPointsDocument();
   if (!scanResult) {
+    console.warn('[scanDocument] No document active or accessible.');
     return CardService.newCardBuilder()
       .setHeader(CardService.newCardHeader().setTitle('No Document Found'))
       .addSection(
@@ -347,6 +437,7 @@ export function scanDocument() {
     scanResult.openMatches.length === 0 &&
     scanResult.completedMatches.length === 0
   ) {
+    console.log('[scanDocument] Document scan found 0 action points. Showing empty state card.');
     return CardService.newCardBuilder()
       .setHeader(CardService.newCardHeader().setTitle('No Action Points'))
       .addSection(
@@ -360,28 +451,37 @@ export function scanDocument() {
       .build();
   }
 
+  console.log(
+    `[scanDocument] Returning buildActionPointsScanResultsCard: open=${scanResult.openTasks.length}, completed=${scanResult.completedTasks.length}.`
+  );
   return buildActionPointsScanResultsCard(scanResult);
 }
 
 export function sendToTodoist(e: GoogleAppsScript.Addons.EventObject) {
+  console.log('[sendToTodoist] sendToTodoist action invoked.');
   const result = sendToTodoistLogic(e);
+  console.log(`[sendToTodoist] Result message: "${result.message}"`);
   return CardService.newActionResponseBuilder()
     .setNotification(CardService.newNotification().setText(result.message))
     .build();
 }
 
 export function applyDocumentActions(e: GoogleAppsScript.Addons.EventObject) {
+  console.log('[applyDocumentActions] applyDocumentActions action invoked.');
   const result = applyDocumentActionsLogic(e);
+  console.log(`[applyDocumentActions] Result message: "${result.message}"`);
   return CardService.newActionResponseBuilder()
     .setNotification(CardService.newNotification().setText(result.message))
     .build();
 }
 
 export function populatePeopleConfig(e: any) {
+  console.log('[populatePeopleConfig] populatePeopleConfig action invoked.');
   const params = e.parameters || {};
   const formInput = e.formInput || {};
   const targetLayer = params.targetLayer || formInput.targetLayer || 'global';
   const result = populatePeopleConfigLogic(e, targetLayer);
+  console.log(`[populatePeopleConfig] Result message: "${result.message}"`);
   return CardService.newActionResponseBuilder()
     .setNotification(CardService.newNotification().setText(result.message))
     .build();

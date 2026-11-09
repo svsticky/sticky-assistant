@@ -8,8 +8,13 @@ vi.hoisted(() => {
   } as any;
 });
 
-import { applyDocumentActionsLogic, formatTodoistExportTask } from './editing';
-import { parseMeetingDate, scanActionPointsDocument } from './scanning';
+import {
+  applyDocumentActionsLogic,
+  formatTodoistExportTask,
+  getNewDetectedPeople,
+  populatePeopleConfigLogic,
+} from './editing';
+import { compareActionPoints, parseMeetingDate, scanActionPointsDocument } from './scanning';
 
 // Mock properties/settings
 const mockUserProperties: Record<string, string> = {};
@@ -122,7 +127,18 @@ globalThis.DocumentApp = {
     LIST_ITEM: 'LIST_ITEM',
   },
   getActiveDocument: () => ({
+    getId: () => 'mock-doc-id',
+    getName: () => 'Mock Document',
     getBody: () => mockBody,
+  }),
+} as any;
+
+globalThis.DriveApp = {
+  getFileById: (_id: string) => ({
+    getParents: () => ({
+      hasNext: () => false,
+      next: () => null,
+    }),
   }),
 } as any;
 
@@ -211,6 +227,41 @@ describe('applyDocumentActionsLogic', () => {
     expect(mockChildren[1].getType()).toBe('LIST_ITEM');
     expect((mockChildren[1] as MockListItem).glyphType).toBe('BULLET');
   });
+
+  it('scans document directly when matchesJson is not provided in parameters', () => {
+    // An unbolded completed task and a bold open task
+    const completedParagraph = new MockParagraph('PARAGRAPH', 'AP Aron: Completed task', false);
+    const openParagraph = new MockParagraph('PARAGRAPH', 'AP Aron: Open task', true);
+    mockChildren.push(completedParagraph);
+    mockChildren.push(openParagraph);
+
+    const event = {
+      parameters: {}, // No matchesJson!
+      formInput: {
+        addToTopAction: 'addToTop',
+        replaceInPlaceAction: 'replaceInPlace',
+      },
+    };
+
+    const res = applyDocumentActionsLogic(event);
+    expect(res.ok).toBe(true);
+    expect(completedParagraph.strikethrough).toBe(true);
+
+    // Verify summary inserted at top
+    expect(mockChildren[0].text).toBe('Action points');
+    expect(mockChildren[1].text).toBe('AP Aron: Open task');
+  });
+
+  it('returns graceful message when no checkbox actions are selected', () => {
+    const event = {
+      parameters: {},
+      formInput: {},
+    };
+
+    const res = applyDocumentActionsLogic(event);
+    expect(res.ok).toBe(true);
+    expect(res.message).toBe('No actions selected. Please check at least one box.');
+  });
 });
 
 describe('formatTodoistExportTask', () => {
@@ -228,10 +279,10 @@ describe('formatTodoistExportTask', () => {
       },
     };
     const result = formatTodoistExportTask(task, peopleConfig);
-    expect(result).toBe('[AP] 2026-07-01 +RubenBroere /Development Write code');
+    expect(result).toBe('[AP] Write code /Development 2026-07-01 +RubenBroere');
   });
 
-  it('defaults to today when date is null', () => {
+  it('omits date when date is null and no defaultDueDate is provided', () => {
     const task = {
       person: 'Bob',
       action: 'Test application',
@@ -245,12 +296,23 @@ describe('formatTodoistExportTask', () => {
       },
     };
     const result = formatTodoistExportTask(task, peopleConfig);
-    const d = new Date();
-    const year = d.getFullYear();
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const date = String(d.getDate()).padStart(2, '0');
-    const expectedToday = `${year}-${month}-${date}`;
-    expect(result).toBe(`[AP] ${expectedToday} +BobTester /QA Test application`);
+    expect(result).toBe('[AP] Test application /QA +BobTester');
+  });
+
+  it('preserves date in action text and moves due date and assignee to the end', () => {
+    const task = {
+      person: 'Ruben',
+      action: 'Prepare proposal for 2026-11-01 meeting',
+      date: '2026-11-12',
+      order: 1,
+    };
+    const peopleConfig = {
+      Ruben: {
+        todoist_id: 'RubenBroere',
+      },
+    };
+    const result = formatTodoistExportTask(task, peopleConfig);
+    expect(result).toBe('[AP] Prepare proposal for 2026-11-01 meeting 2026-11-12 +RubenBroere');
   });
 
   it('falls back to task.person when not in configuration', () => {
@@ -262,7 +324,7 @@ describe('formatTodoistExportTask', () => {
     };
     const peopleConfig = {};
     const result = formatTodoistExportTask(task, peopleConfig);
-    expect(result).toBe('[AP] 2026-07-03 +Charlie Deploy app');
+    expect(result).toBe('[AP] Deploy app 2026-07-03 +Charlie');
   });
 
   it('falls back to task.person when in configuration but without todoist_id', () => {
@@ -278,7 +340,7 @@ describe('formatTodoistExportTask', () => {
       },
     };
     const result = formatTodoistExportTask(task, peopleConfig);
-    expect(result).toBe('[AP] 2026-07-04 +Diana Write docs');
+    expect(result).toBe('[AP] Write docs 2026-07-04 +Diana');
   });
 
   it('uses defaultDueDate when task date is null', () => {
@@ -294,7 +356,112 @@ describe('formatTodoistExportTask', () => {
       },
     };
     const result = formatTodoistExportTask(task, peopleConfig, '2026-07-15');
-    expect(result).toBe('[AP] 2026-07-15 +AliceA Run task');
+    expect(result).toBe('[AP] Run task 2026-07-15 +AliceA');
+  });
+});
+
+describe('getNewDetectedPeople', () => {
+  it('returns empty array when all detected people are already in peopleConfig', () => {
+    const found = { Ruben: true, Aron: true, Toine: true };
+    const peopleConfig = {
+      Ruben: { aliases: ['ruben b'] },
+      Aron: {},
+      Toine: {},
+    };
+    expect(getNewDetectedPeople(found, peopleConfig)).toEqual([]);
+  });
+
+  it('matches existing people case-insensitively and via aliases', () => {
+    const found = { ruben: true, chef: true };
+    const peopleConfig = {
+      Ruben: { aliases: ['Chef', 'ruben b'] },
+    };
+    expect(getNewDetectedPeople(found, peopleConfig)).toEqual([]);
+  });
+
+  it('ignores everyone and iedereen', () => {
+    const found = { everyone: true, Iedereen: true };
+    const peopleConfig = {};
+    expect(getNewDetectedPeople(found, peopleConfig)).toEqual([]);
+  });
+
+  it('returns only new unconfigured people', () => {
+    const found = { Ruben: true, Kees: true, Jan: true, everyone: true };
+    const peopleConfig = {
+      Ruben: {},
+    };
+    expect(getNewDetectedPeople(found, peopleConfig)).toEqual(['Kees', 'Jan']);
+  });
+});
+
+describe('compareActionPoints', () => {
+  it('sorts by order ascending', () => {
+    const tasks = [
+      { person: 'Charlie', order: 3 },
+      { person: 'Alice', order: 1 },
+      { person: 'Bob', order: 2 },
+    ];
+    tasks.sort(compareActionPoints);
+    expect(tasks.map((t) => t.person)).toEqual(['Alice', 'Bob', 'Charlie']);
+  });
+
+  it('puts null and undefined orders after defined numerical orders', () => {
+    const tasks = [
+      { person: 'NoOrder1', order: null },
+      { person: 'First', order: 1 },
+      { person: 'NoOrder2' },
+      { person: 'Second', order: 2 },
+    ];
+    tasks.sort(compareActionPoints);
+    expect(tasks.map((t) => t.person)).toEqual(['First', 'Second', 'NoOrder1', 'NoOrder2']);
+  });
+
+  it('breaks ties alphabetically by person name', () => {
+    const tasks = [
+      { person: 'Zach', order: 1 },
+      { person: 'Alice', order: 1 },
+      { person: 'Bob', order: null },
+      { person: 'Aaron', order: null },
+    ];
+    tasks.sort(compareActionPoints);
+    expect(tasks.map((t) => t.person)).toEqual(['Alice', 'Zach', 'Aaron', 'Bob']);
+  });
+});
+
+describe('populatePeopleConfigLogic', () => {
+  beforeEach(() => {
+    mockUserProperties['actionPointsExtractor__peopleConfig'] = JSON.stringify({
+      Ruben: { aliases: [] },
+    });
+  });
+
+  it('adds newly detected people to configuration', () => {
+    const event = {
+      parameters: {
+        peopleJson: JSON.stringify(['Kees', 'Jan', 'Ruben']),
+      },
+    };
+    const res = populatePeopleConfigLogic(event, 'global');
+    expect(res.ok).toBe(true);
+    expect(res.addedCount).toBe(2);
+
+    const savedConfig = JSON.parse(
+      mockUserProperties['actionPointsExtractor__peopleConfig'] || '{}'
+    );
+    expect(savedConfig.Kees).toBeDefined();
+    expect(savedConfig.Jan).toBeDefined();
+    expect(savedConfig.Ruben).toBeDefined();
+  });
+
+  it('returns gracefully when no new people are found', () => {
+    const event = {
+      parameters: {
+        peopleJson: JSON.stringify(['Ruben', 'everyone']),
+      },
+    };
+    const res = populatePeopleConfigLogic(event, 'global');
+    expect(res.ok).toBe(true);
+    expect(res.addedCount).toBe(0);
   });
 });
 
@@ -338,6 +505,26 @@ describe('scanActionPointsDocument next meeting date', () => {
     expect(result?.nextMeetingDate).toBe('2026-07-07');
   });
 
+  it('finds nested meeting date under numbered 22. Volgende vergadering (screenshot scenario)', () => {
+    const heading = new MockParagraph('PARAGRAPH', '22. Volgende vergadering');
+    const dateItem = new MockListItem('LIST_ITEM', 'a. 2026-11-12');
+    const agendaItem = new MockListItem('LIST_ITEM', 'b. Agendapunten');
+    const closingItem = new MockParagraph('PARAGRAPH', '23. Sluiting');
+
+    mockChildren.push(heading, dateItem, agendaItem, closingItem);
+
+    const result = scanActionPointsDocument();
+    expect(result?.nextMeetingDate).toBe('2026-11-12');
+  });
+
+  it('finds meeting date on the same line as header', () => {
+    const heading = new MockParagraph('PARAGRAPH', '22. Volgende vergadering: 2026-11-12');
+    mockChildren.push(heading);
+
+    const result = scanActionPointsDocument();
+    expect(result?.nextMeetingDate).toBe('2026-11-12');
+  });
+
   it('finds nested meeting date under Next meeting paragraph', () => {
     const heading = new MockParagraph('PARAGRAPH', 'Next meeting:');
     const dateItem = new MockListItem('LIST_ITEM', '15-09-2026 - online');
@@ -349,10 +536,24 @@ describe('scanActionPointsDocument next meeting date', () => {
     expect(result?.nextMeetingDate).toBe('2026-09-15');
   });
 
+  it('continues searching document if an earlier candidate did not contain a meeting date', () => {
+    // Earlier candidate that was just an agenda item or lacked a date
+    const falseHeading = new MockListItem('LIST_ITEM', 'Volgende vergadering');
+    const falseChild = new MockListItem('LIST_ITEM', 'Ruben: Helix lustrum stukje [5m]');
+    // Real meeting section later in the document
+    const realHeading = new MockParagraph('PARAGRAPH', '22. Volgende vergadering');
+    const realDate = new MockListItem('LIST_ITEM', 'a. 2026-11-12');
+
+    mockChildren.push(falseHeading, falseChild, realHeading, realDate);
+
+    const result = scanActionPointsDocument();
+    expect(result?.nextMeetingDate).toBe('2026-11-12');
+  });
+
   it('stops search if sibling or parent element is encountered', () => {
     const heading = new MockListItem('LIST_ITEM', 'Volgende vergadering');
     heading.nestingLevel = 1;
-    
+
     const anotherHeading = new MockListItem('LIST_ITEM', 'Other topic');
     anotherHeading.nestingLevel = 1;
 

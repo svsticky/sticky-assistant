@@ -1,5 +1,6 @@
 import { Tool } from './Tool';
 import { COLORS, ICON_URLS } from './branding';
+import { APP_VERSION } from './version';
 
 type ToolCardMeta = Pick<Tool, 'id' | 'name' | 'icon' | 'settings'>;
 
@@ -32,6 +33,7 @@ export function buildToolCard(
       CardService.newDecoratedText()
         .setStartIcon(CardService.newIconImage().setIconUrl(ICON_URLS.info))
         .setText(`<font color="${COLORS.MUTED}">${info}</font>`)
+        .setBottomLabel(`Version ${APP_VERSION}`)
         .setWrapText(true)
     );
     builder.addSection(infoSection);

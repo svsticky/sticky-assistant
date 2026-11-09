@@ -2,6 +2,7 @@
 export * from './triggers';
 
 // Core UI & Selection Navigation Callbacks
+export { APP_VERSION } from './core/version';
 export { openTool, openToolSelector } from './core/triggerHandler';
 export {
   buildUnifiedSettingsCard,
